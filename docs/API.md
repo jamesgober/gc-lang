@@ -16,9 +16,9 @@
 </div>
 <br>
 
-> **Version 0.2.0.** The public surface is being finalised across the 0.x series and
-> frozen at `1.0.0`. Everything documented here is live and tested; see
-> [`../dev/ROADMAP.md`](../dev/ROADMAP.md) for what is still to come.
+> **Version 1.0.0 — stable.** The public surface documented here is frozen and will not
+> break until `2.0`; see the [SemVer promise](#stability). Everything below is live and
+> tested.
 
 A tracing, cycle-collecting, `#![forbid(unsafe_code)]` garbage collector for
 interpreted-language runtimes. Allocate objects into a [`Heap`](#heap), refer to them
@@ -49,6 +49,7 @@ by [`Gc`](#gc) handle, and reclaim the unreachable ones with
   - [When to collect](#pattern-when)
   - [Multiple heaps](#pattern-multiple-heaps)
   - [`no_std`](#pattern-no-std)
+- **[Stability & SemVer Promise](#stability)**
 - **[API Safety](#api-safety)**
 
 <br><br>
@@ -59,7 +60,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-gc-lang = "0.2"
+gc-lang = "1.0"
 ```
 
 Or via the terminal:
@@ -72,7 +73,7 @@ cargo add gc-lang
 
 ```toml
 [dependencies]
-gc-lang = { version = "0.2", default-features = false }
+gc-lang = { version = "1.0", default-features = false }
 ```
 
 <hr>
@@ -616,10 +617,38 @@ Disable default features to build without `std`:
 
 ```toml
 [dependencies]
-gc-lang = { version = "0.2", default-features = false }
+gc-lang = { version = "1.0", default-features = false }
 ```
 
 The public surface is identical; the crate needs only `alloc` and a global allocator.
+
+<hr>
+<br>
+
+<h2 id="stability">Stability &amp; SemVer Promise</h2>
+
+**1.0.0 freezes the public surface.** The six exported items — [`Heap`](#heap),
+[`Gc`](#gc), [`Trace`](#trace), [`Tracer`](#tracer), [`CollectStats`](#collectstats),
+and [`GcError`](#gcerror) — and every public method, signature, and documented
+behaviour listed on this page are stable. They will not change in a breaking way for
+the entire `1.x` series.
+
+Within `1.x`, the project guarantees:
+
+- **No breaking changes.** No exported item is removed or renamed; no method signature,
+  bound, or documented behaviour changes incompatibly. Anything that would break a
+  downstream crate is a `2.0`.
+- **Additive minor releases.** New methods, new types, and new trait impls may arrive in
+  a `1.y` release. The two `#[non_exhaustive]` types — [`CollectStats`](#collectstats)
+  and [`GcError`](#gcerror) — may gain fields or variants; they are already marked so a
+  downstream `match` accounts for it.
+- **Patch releases** carry bug fixes, documentation, and internal or performance work
+  with no surface change.
+
+Not covered by the promise: the exact wording of `Debug` output, precise benchmark
+figures, internal slot layout, and the specific generation value a reused slot carries
+(only the guarantee that a stale handle resolves to `None`). MSRV increases are treated
+as at least a minor bump and recorded in the [CHANGELOG](../CHANGELOG.md).
 
 <hr>
 <br>

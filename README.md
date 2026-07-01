@@ -26,7 +26,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition).
     </p>
     <blockquote>
-        <strong>Status: pre-1.0, in active development.</strong> The public API is being designed across the 0.x series and frozen at <code>1.0.0</code>. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a>.
+        <strong>1.0.0 is the API freeze.</strong> The public surface is stable and will not break until <code>2.0</code>. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> and the <a href="./docs/API.md#stability">SemVer promise</a>.
     </blockquote>
 </div>
 
@@ -75,7 +75,7 @@ no policy on *when* to collect. The runtime keeps that control.
 
 ```toml
 [dependencies]
-gc-lang = "0.2"
+gc-lang = "1.0"
 ```
 
 Or from the terminal:
@@ -88,7 +88,7 @@ cargo add gc-lang
 
 ```toml
 [dependencies]
-gc-lang = { version = "0.2", default-features = false }
+gc-lang = { version = "1.0", default-features = false }
 ```
 
 <br>
@@ -205,10 +205,10 @@ included.
 
 ## Status
 
-**Pre-1.0, in active development.** `v0.2.0` ships the core collector; the public API
-is being finalised across the 0.x series and frozen at `1.0.0`. See the
-[`ROADMAP`](./dev/ROADMAP.md), [`docs/API.md`](./docs/API.md), and
-[`CHANGELOG.md`](./CHANGELOG.md).
+**Stable — 1.0.0 is the API freeze.** The public surface is frozen and will not break
+until `2.0`; 1.x releases are additive only. See the
+[SemVer promise](./docs/API.md#stability), [`docs/API.md`](./docs/API.md), the
+[`ROADMAP`](./dev/ROADMAP.md), and [`CHANGELOG.md`](./CHANGELOG.md).
 
 <br>
 

@@ -21,6 +21,22 @@
 
 ---
 
+## [1.0.0] - 2026-07-01
+
+**API freeze.** The public surface introduced in 0.2.0 is now stable and will not break
+until 2.0; 1.x releases are additive only. No functional changes since 0.2.0 — this
+release records the SemVer promise and marks the collector production-ready.
+
+### Changed
+
+- `docs/API.md` marked stable with an explicit [SemVer promise](./docs/API.md#stability):
+  the six exported items (`Heap`, `Gc`, `Trace`, `Tracer`, `CollectStats`, `GcError`)
+  and their documented behaviour are frozen for the `1.x` series.
+- Version banners and installation snippets across `README.md` and `docs/API.md` updated
+  to `1.0`.
+
+---
+
 ## [0.2.0] - 2026-07-01
 
 The core release: a working garbage collector. `gc-lang` now provides a safe,
@@ -69,6 +85,7 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/gc-lang/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/jamesgober/gc-lang/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/jamesgober/gc-lang/compare/v0.2.0...v1.0.0
 [0.2.0]: https://github.com/jamesgober/gc-lang/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/gc-lang/releases/tag/v0.1.0

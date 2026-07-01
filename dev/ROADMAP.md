@@ -25,7 +25,14 @@ job is to reclaim and reuse slots. Forcing an append-only arena under a reclaimi
 collector would defeat the point, so the heap owns its own slot store with a free
 list. No hard task was deferred; the dependency simply was not a fit for the design.
 
-## v1.0.0 - API freeze
-Public surface stable and frozen until 2.0.
-- [ ] docs/API.md marked stable; SemVer promise recorded.
-- [ ] Full test + benchmark suite green on all three platforms.
+## v1.0.0 - API freeze — DONE
+Public surface stable and frozen until 2.0. No new API: the minimal 0.2.0 surface
+(`Heap`, `Gc`, `Trace`, `Tracer`, `CollectStats`, `GcError`) is promoted to stable
+as-is. 1.x is additive only.
+- [x] docs/API.md marked stable; SemVer promise recorded (docs/API.md#stability).
+- [x] Full test + benchmark suite green on all three platforms (CI matrix:
+      Linux/macOS/Windows × stable/1.85; verified locally on WSL2 Ubuntu).
+
+## Beyond 1.0 (additive, non-breaking)
+Candidate 1.x additions, none required for the freeze: `Heap::clear`, live-object
+iteration, incremental/generational collection modes, per-collection byte accounting.
