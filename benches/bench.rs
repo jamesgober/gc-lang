@@ -1,8 +1,9 @@
 //! Criterion benchmarks for the collector's hot paths.
 //!
-//! Four groups cover the operations a runtime pays for: allocation (fresh slot and
-//! reused slot), handle resolution, a single mark-and-sweep over a graph, and a
-//! steady-state allocate/collect loop that never grows the backing store.
+//! The groups cover the operations a runtime pays for: allocation (fresh slot and
+//! reused slot), handle resolution, a mark-and-sweep over a fully reachable graph
+//! (mark-heavy) and over a fully unreachable one (sweep-heavy), and a steady-state
+//! allocate/collect loop that never grows the backing store.
 //!
 //! Run with `cargo bench`. Reports land under `target/criterion/`.
 
@@ -115,6 +116,31 @@ fn bench_collect(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_collect_garbage(c: &mut Criterion) {
+    // The sweep-heavy case: a whole tree with no roots, so every object is dropped
+    // and every slot goes back to the free list. This is the path that does the
+    // per-slot generation bookkeeping.
+    let mut group = c.benchmark_group("collect_unreachable_tree");
+    for &size in &[10_000usize, 100_000, 1_000_000] {
+        group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
+            b.iter_batched(
+                || {
+                    let mut heap = Heap::<Node>::with_capacity(size);
+                    let _ = build_tree(&mut heap, size);
+                    heap
+                },
+                |mut heap| {
+                    let stats = heap.collect(black_box(std::iter::empty()));
+                    assert_eq!(stats.freed, size);
+                    heap
+                },
+                criterion::BatchSize::LargeInput,
+            );
+        });
+    }
+    group.finish();
+}
+
 fn bench_steady_state(c: &mut Criterion) {
     // Allocate a small graph and immediately reclaim all of it, repeatedly. After
     // warm-up this neither grows the backing store nor allocates scratch.
@@ -136,6 +162,7 @@ criterion_group!(
     bench_alloc_reused,
     bench_get,
     bench_collect,
+    bench_collect_garbage,
     bench_steady_state,
 );
 criterion_main!(benches);

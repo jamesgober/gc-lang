@@ -11,6 +11,15 @@ use crate::{Gc, GcError, Trace, Tracer};
 /// waits on the free list to be handed out again. The generation advances each time
 /// the slot is reclaimed, which is what invalidates handles into a slot's earlier
 /// occupants.
+///
+/// A slot has exactly `2^32` generations, `0..=u32::MAX`, and so carries at most
+/// `2^32` occupants over the heap's lifetime. When the occupant at generation
+/// `u32::MAX` is reclaimed the slot is *retired*: it keeps `value: None` and
+/// `generation: u32::MAX` forever and is never put back on the free list. Advancing
+/// the counter by wrapping instead would hand generation `0` out again, and with a
+/// LIFO free list a hot slot cycles through all `2^32` generations in minutes, after
+/// which a stale handle would name the slot's new occupant (ABA). A retired slot can
+/// never be occupied again, so no handle into it can ever resolve.
 struct Slot<T> {
     value: Option<T>,
     generation: u32,
@@ -31,9 +40,13 @@ struct Slot<T> {
 /// - **Handles, not pointers.** A [`Gc<T>`] is an index plus a generation stamp, so
 ///   objects can point at one another freely without borrows, and a handle to a
 ///   collected object resolves to `None` instead of dangling.
-/// - **Slots are reused.** Sweeping a dead object returns its slot to a free list;
-///   the next allocation reuses it and bumps its generation. Steady-state
-///   allocate/collect loops do not grow the backing store.
+/// - **Slots are reused.** Sweeping a dead object bumps its slot's generation and
+///   returns the slot to a free list; the next allocation reuses it. A slot serves
+///   `2^32` occupants (generations `0..=u32::MAX`) and is then retired for good
+///   rather than wrapping its generation back to `0`, so a stale handle stays stale
+///   for the heap's whole lifetime. A steady-state allocate/collect loop therefore
+///   grows the backing store by one slot each time one of its slots retires — once
+///   per `2^32` reuses of that slot — and not otherwise.
 /// - **Scratch is pooled.** The mark queue and the mark bitset are retained between
 ///   collections, so a collection allocates nothing on the steady-state path.
 ///
@@ -78,6 +91,7 @@ pub struct Heap<T> {
     /// Object storage, indexed by slot. Grows on demand; never shrinks.
     slots: Vec<Slot<T>>,
     /// Indices of reclaimed slots available for reuse, most-recently-freed first.
+    /// Never holds a retired slot (see [`Slot`]).
     free: Vec<u32>,
     /// Number of occupied slots. Tracked incrementally so [`len`](Heap::len) is O(1).
     live: usize,
@@ -148,10 +162,11 @@ impl<T> Heap<T> {
     ///
     /// # Panics
     ///
-    /// Panics only if the heap has already exhausted its slot space — more than
-    /// `u32::MAX` slots that were never reclaimed, an unreachable ceiling for a
-    /// heap that collects. Use [`try_alloc`](Heap::try_alloc) for an explicit
-    /// non-panicking path.
+    /// Panics only if the heap has exhausted its slot space: no slot is free and all
+    /// `u32::MAX + 1` slot indices are either occupied or retired. A slot retires
+    /// only after serving `2^32` occupants, so for a heap that collects this takes
+    /// on the order of `2^64` allocations. Use [`try_alloc`](Heap::try_alloc) for an
+    /// explicit non-panicking path.
     ///
     /// # Examples
     ///
@@ -185,9 +200,12 @@ impl<T> Heap<T> {
     ///
     /// # Errors
     ///
-    /// Returns [`GcError::CapacityExhausted`] when every one of the `u32::MAX + 1`
-    /// slot indices is in use and no slot is free. The heap is left unchanged;
-    /// running a collection to reclaim dead slots is the way to recover.
+    /// Returns [`GcError::CapacityExhausted`] when no slot is free and every one of
+    /// the `u32::MAX + 1` slot indices is either occupied or retired (a slot
+    /// retires after serving `2^32` occupants; see [`Heap`]). The heap is left
+    /// unchanged. Running a collection to reclaim dead slots is the way to recover;
+    /// if every slot is retired nothing can be reclaimed, and the heap cannot
+    /// allocate again.
     ///
     /// # Examples
     ///
@@ -234,7 +252,14 @@ impl<T> Heap<T> {
     /// Resolution is a direct slot lookup, not a search. The `None` case covers both
     /// an out-of-range handle and a stale one — a handle whose object was collected
     /// and whose slot has since moved on to a new generation — so resolving a
-    /// handle never reads an unrelated value.
+    /// handle this heap minted never reads an unrelated value. That holds for the
+    /// heap's whole lifetime: generations never wrap (a slot whose counter is used
+    /// up is retired instead), so a stale handle never becomes valid again.
+    ///
+    /// A [`Gc<T>`] does not record which heap minted it. A handle from a
+    /// *different* `Heap<T>` of the same `T` is not detected: if its index and
+    /// generation happen to match a live object here, it resolves to that object.
+    /// Use each handle only with the heap that returned it.
     ///
     /// # Examples
     ///
@@ -373,9 +398,11 @@ impl<T> Heap<T> {
 
     /// Returns the number of slots the backing store can hold before it must grow.
     ///
-    /// Reflects allocated capacity, including slots currently free. It never
-    /// decreases across a collection: sweeping returns slots to the free list rather
-    /// than releasing memory, so the store stays sized to the high-water mark.
+    /// Reflects allocated capacity, including slots currently free and slots that
+    /// have retired. It never decreases across a collection: sweeping returns slots
+    /// to the free list rather than releasing memory, so the store stays sized to
+    /// the high-water mark. A retired slot (one that has served `2^32` occupants;
+    /// see [`Heap`]) keeps its place in the store but is never reused.
     ///
     /// # Examples
     ///
@@ -398,7 +425,8 @@ impl<T> Heap<T> {
     /// [`Trace::trace`], visiting each reachable object exactly once — so cycles
     /// terminate and shared subgraphs are not re-scanned. **Sweep:** every object
     /// that was not marked is dropped, its slot's generation is advanced, and the
-    /// slot is returned to the free list for reuse.
+    /// slot is returned to the free list for reuse (or retired, if that was its last
+    /// generation).
     ///
     /// `roots` is the set of handles the runtime considers live from the outside: an
     /// interpreter's value stack, its global environment, VM registers. Anything
@@ -409,6 +437,20 @@ impl<T> Heap<T> {
     /// The cost is `O(reachable)` to mark plus `O(slots)` to sweep. The mark queue
     /// and mark bitset are retained between calls, so a steady-state collection does
     /// not allocate.
+    ///
+    /// # Panics
+    ///
+    /// `collect` itself does not panic, but it runs user code — [`Trace::trace`]
+    /// during mark and `T`'s destructor during sweep — and a panic there propagates
+    /// out of `collect`. The heap stays consistent when that happens: every slot
+    /// swept before the panic, including the one whose destructor panicked, is
+    /// already reclaimed (generation advanced, slot on the free list, [`len`] down
+    /// by one), and every slot not yet swept still holds its object and counts as
+    /// live. Unreachable objects the interrupted pass did not reach are reclaimed by
+    /// the next collection. No slot is leaked, and [`len`] always equals the number
+    /// of objects the heap still stores.
+    ///
+    /// [`len`]: Heap::len
     ///
     /// # Examples
     ///
@@ -442,68 +484,98 @@ impl<T> Heap<T> {
         I: IntoIterator<Item = Gc<T>>,
         T: Trace,
     {
+        // Split the borrow of `self` by field: the mark loop reads `slots` while
+        // `Trace::trace` pushes into `worklist`. Working on the pooled fields in
+        // place (rather than moving the queue out and back) also means a panic in
+        // user code cannot strand the pooled allocations.
+        let Self {
+            slots,
+            free,
+            live,
+            worklist,
+            marks,
+        } = self;
+
         // Seed the work queue with the roots. Reuse the pooled queue so a
         // steady-state collection does not allocate. Roots are validated at pop
         // time along with everything else, so stale roots cost nothing here.
-        let mut work = core::mem::take(&mut self.worklist);
-        work.clear();
+        worklist.clear();
         for root in roots {
-            work.push((root.index(), root.generation()));
+            worklist.push((root.index(), root.generation()));
         }
 
-        // A fresh, zeroed mark bit for every slot.
-        self.reset_marks();
+        // A fresh, zeroed mark bit for every slot. The allocation is reused across
+        // collections; only a grow past the high-water mark reallocates.
+        marks.clear();
+        marks.resize(slots.len().div_ceil(64), 0);
 
         // Mark: drain the queue, marking each live, current, not-yet-marked slot and
         // enqueuing the handles it reports. The mark check makes cycles terminate.
-        while let Some((index, generation)) = work.pop() {
+        while let Some((index, generation)) = worklist.pop() {
             let i = index as usize;
-            let current = matches!(
-                self.slots.get(i),
-                Some(slot) if slot.generation == generation && slot.value.is_some()
-            );
-            if !current || bit_is_set(&self.marks, i) {
+            let value = match slots.get(i) {
+                Some(slot) if slot.generation == generation => match slot.value.as_ref() {
+                    Some(value) => value,
+                    None => continue,
+                },
+                _ => continue,
+            };
+            if bit_is_set(marks, i) {
                 continue;
             }
-            set_bit(&mut self.marks, i);
-            // Immutable borrow of `slots` plus a mutable borrow of the local `work`:
-            // disjoint, so tracing children needs no unsafe and no second pass.
-            if let Some(value) = self.slots[i].value.as_ref() {
-                value.trace(&mut Tracer::new(&mut work));
-            }
+            set_bit(marks, i);
+            value.trace(&mut Tracer::new(worklist));
         }
 
-        // Sweep: drop every unmarked occupant, advance its slot's generation to
-        // invalidate outstanding handles, and return the slot to the free list.
+        // Sweep: reclaim every unmarked occupant. All of a slot's bookkeeping —
+        // taking the object out, advancing or retiring the generation, the free
+        // list, the live count — is finished *before* the object's destructor runs.
+        // That ordering is the drop guard: if `T::drop` panics, the unwind leaves
+        // through a heap whose every slot is either fully reclaimed or untouched,
+        // so nothing leaks and `live` stays exact. The slots after the panicking
+        // one are simply not swept this time; they still hold their objects and
+        // still count as live, and the next collection reclaims them.
         let mut freed = 0usize;
-        for i in 0..self.slots.len() {
-            let marked = bit_is_set(&self.marks, i);
-            let slot = &mut self.slots[i];
-            if slot.value.is_some() && !marked {
-                slot.value = None; // drops the object
-                slot.generation = slot.generation.wrapping_add(1);
-                self.free.push(i as u32);
-                freed += 1;
+        for (i, slot) in slots.iter_mut().enumerate() {
+            if bit_is_set(marks, i) {
+                continue;
             }
+            let Some(dead) = slot.value.take() else {
+                continue;
+            };
+            // Advance the generation so every handle to `dead` goes stale, and offer
+            // the slot for reuse. `i` fits in a `u32`: `try_alloc` never creates a
+            // slot index above `u32::MAX`. When there is no next generation the
+            // slot has served its last occupant and is retired instead: it stays
+            // empty at `u32::MAX` and never returns to the free list, so no
+            // generation is ever handed out twice (no ABA on wrap).
+            if let Some(next) = slot.generation.checked_add(1) {
+                slot.generation = next;
+                free.push(i as u32);
+            }
+            *live -= 1;
+            freed += 1;
+            drop(dead);
         }
-        self.live -= freed;
 
-        // Return the pooled queue for the next collection to reuse.
-        self.worklist = work;
-
-        CollectStats {
-            live: self.live,
-            freed,
-        }
+        CollectStats { live: *live, freed }
     }
 
-    /// Resizes the mark bitset to cover every slot and zeroes it. The allocation is
-    /// reused across collections; only a grow past the high-water mark reallocates.
-    #[inline]
-    fn reset_marks(&mut self) {
-        let words = self.slots.len().div_ceil(64);
-        self.marks.clear();
-        self.marks.resize(words, 0);
+    /// Moves a free slot's generation forward to `generation`, so tests can reach
+    /// the end of a slot's generation range without `2^32` real reuses.
+    ///
+    /// Test-only, and only ever forward: moving a generation backwards could
+    /// re-validate a stale handle, which is the exact bug this hook exists to test.
+    #[cfg(test)]
+    pub(crate) fn advance_free_slot_generation(&mut self, index: u32, generation: u32) {
+        let slot = &mut self.slots[index as usize];
+        assert!(slot.value.is_none(), "slot {index} is occupied");
+        assert!(self.free.contains(&index), "slot {index} is not free");
+        assert!(
+            generation >= slot.generation,
+            "generations only move forward"
+        );
+        slot.generation = generation;
     }
 }
 
@@ -732,5 +804,366 @@ mod tests {
         let text = alloc::format!("{heap:?}");
         assert!(text.contains("live"), "{text}");
         assert!(text.contains("capacity"), "{text}");
+    }
+
+    // --- M60: generations never wrap; a used-up slot is retired ------------------
+
+    /// Frees slot 0 and moves its generation to `generation`, so the next
+    /// allocation lands in slot 0 at that generation.
+    fn heap_with_slot0_at(generation: u32) -> (Heap<Node>, Gc<Node>) {
+        let mut heap = Heap::new();
+        let first = heap.alloc(Node::leaf());
+        let _ = heap.collect([]);
+        heap.advance_free_slot_generation(0, generation);
+        (heap, first)
+    }
+
+    #[test]
+    fn test_slot_retires_at_last_generation_instead_of_wrapping() {
+        let (mut heap, first) = heap_with_slot0_at(u32::MAX - 1);
+
+        let penultimate = heap.alloc(Node::leaf());
+        assert_eq!(
+            (penultimate.index(), penultimate.generation()),
+            (0, u32::MAX - 1)
+        );
+        let _ = heap.collect([]);
+
+        let last = heap.alloc(Node::leaf());
+        assert_eq!((last.index(), last.generation()), (0, u32::MAX));
+        let stats = heap.collect([]);
+        assert_eq!(stats.freed, 1);
+
+        // Retired: empty, parked at the last generation, and not offered for reuse.
+        assert!(heap.slots[0].value.is_none());
+        assert_eq!(heap.slots[0].generation, u32::MAX);
+        assert!(heap.free.is_empty());
+        assert!(heap.is_empty());
+
+        // The next allocation takes a fresh slot rather than wrapping slot 0 to 0.
+        let fresh = heap.alloc(Node::leaf());
+        assert_eq!((fresh.index(), fresh.generation()), (1, 0));
+        for stale in [first, penultimate, last] {
+            assert!(heap.get(stale).is_none());
+            assert!(!heap.contains(stale));
+        }
+    }
+
+    #[test]
+    fn test_retired_slot_rejects_every_generation() {
+        let (mut heap, _) = heap_with_slot0_at(u32::MAX);
+        let _ = heap.alloc(Node::leaf());
+        let _ = heap.collect([]); // slot 0 retires
+        let keep = heap.alloc(Node::leaf()); // slot 1
+
+        for generation in [0, 1, 2, u32::MAX / 2, u32::MAX - 1, u32::MAX] {
+            let probe: Gc<Node> = Gc::new(0, generation);
+            assert!(heap.get(probe).is_none(), "generation {generation}");
+            assert!(heap.get_mut(probe).is_none(), "generation {generation}");
+            assert!(!heap.contains(probe), "generation {generation}");
+            // As a root it is ignored and resurrects nothing.
+            let stats = heap.collect([probe, keep]);
+            assert_eq!(stats.live, 1);
+            assert_eq!(heap.len(), 1);
+        }
+        assert_invariants(&heap);
+    }
+
+    #[test]
+    fn test_hot_slot_loop_across_retirement_never_revalidates_a_handle() {
+        // The M60 scenario: an alloc/collect loop on a LIFO free list hammers one
+        // slot. Start it a few generations from the end and run well past it.
+        let (mut heap, first) = heap_with_slot0_at(u32::MAX - 5);
+        let mut minted = vec![first];
+        for _ in 0..32 {
+            let h = heap.alloc(Node::leaf());
+            assert!(!minted.contains(&h), "handle {h:?} was issued twice");
+            minted.push(h);
+            let _ = heap.collect([]);
+            assert!(minted.iter().all(|&old| heap.get(old).is_none()));
+            assert_invariants(&heap);
+        }
+        // Slot 0 served generations MAX-5..=MAX (six occupants) and retired; the
+        // loop then moved to slot 1 and stayed there.
+        assert_eq!(heap.slots.len(), 2);
+        assert_eq!(heap.slots[0].generation, u32::MAX);
+        assert_eq!(heap.free, vec![1]);
+    }
+
+    #[test]
+    fn test_store_grows_by_exactly_one_slot_per_retirement() {
+        // Three hot slots, all near the end of their range: each retires once, and
+        // each retirement costs exactly one fresh slot, no more.
+        let mut heap: Heap<Node> = Heap::new();
+        for _ in 0..3 {
+            let _ = heap.alloc(Node::leaf());
+        }
+        let _ = heap.collect([]);
+        for i in 0..3 {
+            heap.advance_free_slot_generation(i, u32::MAX);
+        }
+        for _ in 0..10 {
+            for _ in 0..3 {
+                let _ = heap.alloc(Node::leaf());
+            }
+            let _ = heap.collect([]);
+        }
+        assert_eq!(heap.slots.len(), 6);
+        assert!(heap.slots[..3].iter().all(|s| s.generation == u32::MAX));
+        assert_eq!(heap.free.len(), 3);
+        assert_invariants(&heap);
+    }
+
+    #[test]
+    fn test_free_slot_at_last_generation_is_still_allocatable() {
+        // A free slot at `u32::MAX` has one occupant left in it; only reclaiming
+        // that occupant retires it.
+        let (mut heap, _) = heap_with_slot0_at(u32::MAX);
+        let last = heap.alloc(Node::leaf());
+        assert_eq!((last.index(), last.generation()), (0, u32::MAX));
+        assert!(heap.get(last).is_some());
+        let stats = heap.collect([last]);
+        assert_eq!(stats.live, 1); // a rooted last-generation occupant survives
+        assert!(heap.get(last).is_some());
+    }
+}
+
+/// Structural invariants of a heap, checked by the unit and property tests:
+/// `live` is exact, the free list holds only empty slots and holds each at most
+/// once, and every empty slot not on the free list is retired (generation
+/// `u32::MAX`). The last one is what "no slot leaks" means.
+#[cfg(test)]
+fn assert_invariants<T>(heap: &Heap<T>) {
+    let occupied = heap.slots.iter().filter(|s| s.value.is_some()).count();
+    assert_eq!(heap.live, occupied, "live count drifted");
+
+    let mut on_free = alloc::vec![false; heap.slots.len()];
+    for &i in &heap.free {
+        let i = i as usize;
+        assert!(!on_free[i], "slot {i} is on the free list twice");
+        on_free[i] = true;
+        assert!(heap.slots[i].value.is_none(), "free slot {i} is occupied");
+    }
+    for (i, slot) in heap.slots.iter().enumerate() {
+        if slot.value.is_none() && !on_free[i] {
+            assert_eq!(slot.generation, u32::MAX, "slot {i} leaked");
+        }
+    }
+}
+
+/// M61: a panicking destructor or `trace` must leave the heap consistent.
+/// `catch_unwind` needs `std`.
+#[cfg(all(test, feature = "std"))]
+mod panic_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    use super::*;
+
+    /// An object whose destructor panics when armed.
+    struct Bomb {
+        armed: bool,
+    }
+
+    impl Drop for Bomb {
+        fn drop(&mut self) {
+            if self.armed {
+                panic!("intentional test panic: Bomb::drop");
+            }
+        }
+    }
+
+    impl Trace for Bomb {
+        fn trace(&self, _: &mut Tracer<'_>) {}
+    }
+
+    #[test]
+    fn test_panicking_drop_neither_leaks_the_slot_nor_skews_live() {
+        let mut heap = Heap::new();
+        let a = heap.alloc(Bomb { armed: false });
+        let b = heap.alloc(Bomb { armed: true });
+        let c = heap.alloc(Bomb { armed: false });
+        let d = heap.alloc(Bomb { armed: false });
+
+        let result = catch_unwind(AssertUnwindSafe(|| heap.collect([d])));
+        assert!(result.is_err(), "the destructor's panic propagates");
+
+        // `a` and `b` were swept before the panic; the panicking slot is fully
+        // reclaimed, not leaked. `c` was not reached and is still stored.
+        assert!(heap.get(a).is_none());
+        assert!(heap.get(b).is_none());
+        assert!(heap.get(c).is_some());
+        assert!(heap.get(d).is_some());
+        assert_eq!(heap.len(), 2);
+        assert_eq!(heap.free, vec![0, 1]);
+        assert_eq!(heap.slots[1].generation, 1);
+        assert_invariants(&heap);
+
+        // The next collection finishes the job and the slots are reused.
+        let stats = heap.collect([d]);
+        assert_eq!((stats.live, stats.freed), (1, 1));
+        assert!(heap.get(c).is_none());
+        for _ in 0..3 {
+            let _ = heap.alloc(Bomb { armed: false });
+        }
+        assert_eq!(heap.slots.len(), 4, "freed slots were reused, not leaked");
+        assert_invariants(&heap);
+    }
+
+    #[test]
+    fn test_panicking_drop_in_last_generation_still_retires_the_slot() {
+        let mut heap = Heap::new();
+        let _ = heap.alloc(Bomb { armed: false });
+        let _ = heap.collect([]);
+        heap.advance_free_slot_generation(0, u32::MAX);
+        let bomb = heap.alloc(Bomb { armed: true });
+
+        let result = catch_unwind(AssertUnwindSafe(|| heap.collect([])));
+        assert!(result.is_err());
+
+        assert!(heap.get(bomb).is_none());
+        assert!(heap.is_empty());
+        assert!(
+            heap.free.is_empty(),
+            "a retired slot is never offered again"
+        );
+        assert_eq!(heap.slots[0].generation, u32::MAX);
+        assert_invariants(&heap);
+        let next = heap.alloc(Bomb { armed: false });
+        assert_eq!(next.index(), 1);
+    }
+
+    /// An object whose `trace` panics when armed.
+    struct Tripwire {
+        armed: bool,
+    }
+
+    impl Trace for Tripwire {
+        fn trace(&self, _: &mut Tracer<'_>) {
+            if self.armed {
+                panic!("intentional test panic: Tripwire::trace");
+            }
+        }
+    }
+
+    #[test]
+    fn test_panicking_trace_leaves_the_heap_untouched() {
+        let mut heap = Heap::new();
+        let wire = heap.alloc(Tripwire { armed: true });
+        let garbage = heap.alloc(Tripwire { armed: false });
+
+        let result = catch_unwind(AssertUnwindSafe(|| heap.collect([wire])));
+        assert!(result.is_err());
+
+        // A panic in the mark phase happens before anything is swept.
+        assert_eq!(heap.len(), 2);
+        assert!(heap.get(wire).is_some());
+        assert!(heap.get(garbage).is_some());
+        assert_invariants(&heap);
+
+        heap.get_mut(wire).unwrap().armed = false;
+        let stats = heap.collect([wire]);
+        assert_eq!((stats.live, stats.freed), (1, 1));
+        assert!(heap.get(garbage).is_none());
+        assert_invariants(&heap);
+    }
+}
+
+/// Property: across any interleaving of allocations, collections (with stale
+/// handles mixed into the roots), and jumps of free slots to the end of their
+/// generation range, no handle is ever issued twice and no stale handle ever
+/// resolves — checked against a model that just remembers which handles are alive.
+#[cfg(test)]
+mod generation_props {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    extern crate alloc;
+    use alloc::collections::BTreeSet;
+    use alloc::vec::Vec;
+
+    use proptest::prelude::*;
+
+    use super::*;
+
+    /// A leaf carrying a unique id, so resolving a handle to the *wrong* object is
+    /// caught even if the generation check were fooled.
+    struct Tagged(u64);
+
+    impl Trace for Tagged {
+        fn trace(&self, _: &mut Tracer<'_>) {}
+    }
+
+    #[derive(Debug, Clone)]
+    enum Op {
+        Alloc,
+        /// Root the minted handles whose position matches a `true` flag (cycled);
+        /// dead handles are included, so stale roots are exercised.
+        Collect(Vec<bool>),
+        /// Move a free slot to `u32::MAX - back` (never backwards).
+        Jump {
+            pick: usize,
+            back: u32,
+        },
+    }
+
+    fn op() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            5 => Just(Op::Alloc),
+            2 => prop::collection::vec(any::<bool>(), 0..48).prop_map(Op::Collect),
+            1 => (any::<usize>(), 0u32..4).prop_map(|(pick, back)| Op::Jump { pick, back }),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn no_stale_handle_ever_validates(ops in prop::collection::vec(op(), 1..300)) {
+            let mut heap: Heap<Tagged> = Heap::new();
+            // (handle, id, alive) for every handle ever minted.
+            let mut minted: Vec<(Gc<Tagged>, u64, bool)> = Vec::new();
+            let mut issued: BTreeSet<Gc<Tagged>> = BTreeSet::new();
+
+            for op in ops {
+                match op {
+                    Op::Alloc => {
+                        let id = minted.len() as u64;
+                        let h = heap.alloc(Tagged(id));
+                        prop_assert!(issued.insert(h), "handle {:?} issued twice", h);
+                        minted.push((h, id, true));
+                    }
+                    Op::Collect(flags) => {
+                        let rooted = |k: usize| !flags.is_empty() && flags[k % flags.len()];
+                        let roots: Vec<Gc<Tagged>> = minted
+                            .iter()
+                            .enumerate()
+                            .filter(|&(k, _)| rooted(k))
+                            .map(|(_, &(h, _, _))| h)
+                            .collect();
+                        let before = heap.len();
+                        let stats = heap.collect(roots);
+                        for (k, entry) in minted.iter_mut().enumerate() {
+                            entry.2 = entry.2 && rooted(k);
+                        }
+                        prop_assert_eq!(stats.live + stats.freed, before);
+                    }
+                    Op::Jump { pick, back } => {
+                        if !heap.free.is_empty() {
+                            let index = heap.free[pick % heap.free.len()];
+                            let current = heap.slots[index as usize].generation;
+                            heap.advance_free_slot_generation(index, (u32::MAX - back).max(current));
+                        }
+                    }
+                }
+
+                let alive = minted.iter().filter(|e| e.2).count();
+                prop_assert_eq!(heap.len(), alive);
+                for &(h, id, is_alive) in &minted {
+                    let expected = is_alive.then_some(id);
+                    prop_assert_eq!(heap.get(h).map(|t| t.0), expected, "handle {:?}", h);
+                    prop_assert_eq!(heap.contains(h), is_alive, "handle {:?}", h);
+                }
+                assert_invariants(&heap);
+            }
+        }
     }
 }

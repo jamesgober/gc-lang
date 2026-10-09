@@ -16,9 +16,11 @@
 </div>
 <br>
 
-> **Version 1.0.0 — stable.** The public surface documented here is frozen and will not
+> **Version 1.0.1 — stable.** The public surface documented here is frozen and will not
 > break until `2.0`; see the [SemVer promise](#stability). Everything below is live and
-> tested.
+> tested. 1.0.1 changed no signature; it fixed generation wrap-around (stale handles now
+> stay stale for the heap's lifetime, see [Slot lifetime](#slot-lifetime)) and made
+> [`collect`](#heap-collect) panic-safe.
 
 A tracing, cycle-collecting, `#![forbid(unsafe_code)]` garbage collector for
 interpreted-language runtimes. Allocate objects into a [`Heap`](#heap), refer to them
@@ -39,6 +41,7 @@ by [`Gc`](#gc) handle, and reclaim the unreachable ones with
     - [`get` / `get_mut` / `contains`](#heap-get)
     - [`len` / `is_empty` / `capacity`](#heap-len)
     - [`collect`](#heap-collect)
+    - [Slot lifetime and capacity](#slot-lifetime)
   - [`Gc<T>`](#gc)
   - [`Trace`](#trace)
   - [`Tracer`](#tracer)
@@ -187,8 +190,9 @@ assert!(b.capacity() >= 1024);
 - `fn alloc(&mut self, value: T) -> Gc<T>`
   Allocates `value` and returns a handle to it. Reuses a slot freed by an earlier
   collection when one is available, otherwise grows the store. **Panics** only if the
-  heap has exhausted its slot space (more than `u32::MAX` slots never reclaimed — an
-  unreachable ceiling for a heap that collects).
+  heap has exhausted its slot space: no slot is free and all `u32::MAX + 1` slot
+  indices are occupied or retired (see [Slot lifetime](#slot-lifetime) — on the order
+  of `2^64` allocations for a heap that collects).
 - `fn try_alloc(&mut self, value: T) -> Result<Gc<T>, GcError>`
   The non-panicking counterpart. Returns [`GcError::CapacityExhausted`](#gcerror) at
   the slot-space ceiling instead of panicking; the heap is left unchanged. Prefer it
@@ -225,7 +229,8 @@ assert!(heap.get(h2).is_some());
 - `fn get(&self, handle: Gc<T>) -> Option<&T>`
   Borrows the object behind `handle`, or `None` if the handle does not name a live
   object — either out of range or stale (its object was collected and the slot has
-  moved to a new generation).
+  moved to a new generation). A stale handle stays stale for the heap's whole
+  lifetime: generations never wrap ([Slot lifetime](#slot-lifetime)).
 - `fn get_mut(&mut self, handle: Gc<T>) -> Option<&mut T>`
   The mutating counterpart, with the same staleness guarantee. Use it to update an
   object in place, including rewiring the handles it holds.
@@ -233,7 +238,10 @@ assert!(heap.get(h2).is_some());
   `true` if `handle` names a live object; equivalent to `get(handle).is_some()`
   without producing a borrow.
 
-**Parameters:** `handle` — a [`Gc<T>`](#gc) previously returned by this heap.
+**Parameters:** `handle` — a [`Gc<T>`](#gc) previously returned by this heap. A handle
+carries no heap identity, so a handle from a *different* `Heap<T>` of the same `T` is
+not detected: if its index and generation match a live object here, it resolves to
+that unrelated object. Use each handle only with the heap that returned it.
 
 ```rust
 use gc_lang::{Heap, Trace, Tracer};
@@ -278,9 +286,9 @@ assert!(!heap.contains(h));
   not counted.
 - `fn is_empty(&self) -> bool` — `true` when no live objects remain.
 - `fn capacity(&self) -> usize` — slots the backing store can hold before it must grow,
-  including free slots. Never decreases across a collection: sweeping returns slots to
-  the free list rather than releasing memory, so the store stays sized to its
-  high-water mark.
+  including free and retired slots. Never decreases across a collection: sweeping
+  returns slots to the free list rather than releasing memory, so the store stays sized
+  to its high-water mark.
 
 ```rust
 use gc_lang::{Heap, Trace, Tracer};
@@ -311,7 +319,8 @@ describing the pass. Two phases:
   [`Trace::trace`](#trace), visiting each reachable object once. Cycles terminate;
   shared subgraphs are not re-scanned.
 - **Sweep:** drop every unmarked object, advance its slot's generation (invalidating
-  outstanding handles), and return the slot to the free list.
+  outstanding handles), and return the slot to the free list — or retire it, if that
+  was its last generation ([Slot lifetime](#slot-lifetime)).
 
 **Parameters:** `roots` — anything iterable yielding `Gc<T>`: an array (`[a, b]`), a
 `Vec` drained with `.iter().copied()`, or any iterator. A stale root is ignored, so a
@@ -322,6 +331,17 @@ reclamations. `live + freed` equals the pre-collection population.
 
 **Cost:** `O(reachable)` to mark, `O(slots)` to sweep. The mark queue and mark bitset
 are retained between calls, so a steady-state collection allocates nothing.
+
+**Panics:** `collect` does not panic itself, but it runs your code — `Trace::trace`
+during mark, `T`'s destructor during sweep — and a panic there propagates out of
+`collect`. The heap stays consistent (since 1.0.1). A panic during mark happens before
+anything is swept, so nothing changes. A panic in a destructor leaves every slot swept
+up to and including the panicking one fully reclaimed (generation advanced, slot on the
+free list, `len` down by one) and every later slot untouched (object still stored,
+still counted by `len`); the next collection reclaims what the interrupted one did not
+reach. No slot leaks, and `len` always equals the number of objects stored. (In 1.0.0 a
+panicking destructor leaked its slot and left `len` too high for the rest of the heap's
+life.)
 
 Unreachable cycles are reclaimed — this is the case reference counting cannot handle:
 
@@ -375,6 +395,35 @@ assert_eq!(stats.live, 1);
 assert!(heap.get(kept).is_some());
 ```
 
+<br>
+
+<h4 id="slot-lifetime">Slot lifetime and capacity</h4>
+
+Each slot carries a 32-bit generation, so it can hold exactly `2^32` occupants over the
+heap's lifetime — generations `0` through `u32::MAX`. When the occupant at generation
+`u32::MAX` is collected, the slot is **retired**: it stays empty, it is never returned
+to the free list, and no handle into it can ever resolve again. The generation never
+wraps back to `0`. (In 1.0.0 it did: with a most-recently-freed-first free list, an
+allocate/collect loop reuses the same slot every cycle, and after `2^32` reuses a stale
+handle named the slot's new occupant. 1.0.1 retires the slot instead.)
+
+What that means for capacity, exactly:
+
+- **A stale handle stays stale for the heap's lifetime.** No `(index, generation)` pair
+  is ever issued twice.
+- **A retired slot keeps its memory.** It stays in the backing store (one slot's worth
+  of `Option<T>` plus a `u32`) and counts toward [`capacity`](#heap-len), but is never
+  reused. The store never shrinks, as before.
+- **The store grows by one slot per retirement.** When a hot slot retires, the next
+  allocation that finds no free slot appends a fresh one. A steady allocate/collect
+  loop therefore grows the store by one slot each time one of its slots has been
+  reused `2^32` times, and not otherwise.
+- **Retired slots count toward the slot-space ceiling.**
+  [`GcError::CapacityExhausted`](#gcerror) is returned when no slot is free and all
+  `u32::MAX + 1` indices are occupied or retired. Retiring every index takes
+  `2^32 × 2^32 = 2^64` allocations. If it ever happens, no collection can recover; the
+  heap must be replaced.
+
 <hr>
 <br>
 
@@ -388,10 +437,15 @@ come from [`alloc`](#heap-alloc) / [`try_alloc`](#heap-alloc).
 
 - **Type-tagged:** the `T` is compile-time only and occupies no space. It stops a
   `Gc<Value>` from being resolved against a `Heap<Node>`.
+- **No heap identity:** the handle does not record which heap minted it. Two heaps of
+  the same `T` cannot tell each other's handles apart; a handle from one may resolve to
+  an unrelated object in the other. Use each handle only with the heap that returned
+  it. (A heap id on handles is planned for 2.0; see the ROADMAP.)
 - **Universally `Copy`/`Eq`/`Ord`/`Hash`:** the tag never adds a bound, so `Gc<T>`
   works as a map key regardless of what it points at.
 - **Stale, never dangling:** the generation stamp advances when a slot is reused, so a
-  handle to a collected object resolves to `None`.
+  handle to a collected object resolves to `None` — for the heap's whole lifetime,
+  since generations never wrap ([Slot lifetime](#slot-lifetime)).
 
 ```rust
 use std::collections::HashMap;
@@ -440,6 +494,9 @@ The contract:
   object, so an over-broad `trace` at worst keeps something alive one cycle longer.
 - **`trace` is read-only.** It takes `&self`; it must not mutate the object or allocate
   into the heap.
+- **Mark only handles into the heap being collected.** See [`Tracer::mark`](#tracer):
+  a handle from another heap does not keep its own object alive and may keep an
+  unrelated one alive.
 
 Leaf types implement it as an empty body. A composite reports each field:
 
@@ -492,10 +549,29 @@ The sink a [`Trace`](#trace) implementation reports its outgoing edges to. Hande
   Records that the object being traced holds `handle`, so the collector will visit —
   and keep alive — the object it names. Call it once per owned handle. Recording an edge
   is a single push onto the collector's pooled work queue, so it does not allocate on
-  the steady-state path. The generic parameter lets a value hold handles into several
-  heaps; each is validated against its own heap when that heap collects.
+  the steady-state path.
 
-**Parameters:** `handle` — a [`Gc<T>`](#gc) this object owns.
+**Parameters:** `handle` — a [`Gc<T>`](#gc) this object owns, **into the heap being
+collected**.
+
+**Only handles into the collecting heap do anything.** `mark` is generic: it accepts a
+`Gc<U>` for any `U`, and the compiler does not check that the handle belongs to the
+heap that is collecting. The collector reads every marked handle as an
+`(index, generation)` position in *that* heap. A handle from anywhere else (a heap of
+another type, or another heap of the same type):
+
+- **does not keep its own object alive.** Marking a handle into heap `B` while heap `A`
+  collects does nothing for `B`. An object in `B` referenced only from `A`'s objects
+  survives `B`'s collections only if you pass that handle to `B`'s `collect` as a root.
+- **may keep an unrelated object alive.** If its index and generation match a live
+  object in `A`, that object is marked (and traced) for this collection though nothing
+  in `A` references it. Never unsound — no handle can dangle — but it is over-retention
+  until a collection in which the coincidence does not recur.
+
+(1.0.0's documentation said a foreign handle was "validated against its own heap"; that
+was wrong, and is corrected here. The behaviour itself is unchanged and is pinned by
+`tests/cross_heap.rs`.) Restricting `mark` to the collecting heap's handle type is a
+breaking change, planned for 2.0.
 
 ```rust
 use gc_lang::{Gc, Trace, Tracer};
@@ -564,10 +640,12 @@ The error returned by [`try_alloc`](#heap-alloc). `#[non_exhaustive]`; derives `
 
 | Variant             | Meaning                                                                 |
 |---------------------|-------------------------------------------------------------------------|
-| `CapacityExhausted` | Every one of the `u32::MAX + 1` slot indices is in use and none is free. |
+| `CapacityExhausted` | No slot is free and every one of the `u32::MAX + 1` slot indices is occupied or retired. |
 
-Unreachable for a heap that collects — it takes more than four billion slots that were
-never reclaimed. Recover by running a collection to free dead slots, then retrying.
+Unreachable for a heap that collects — it takes more than four billion slots that are
+live or never reclaimed, or on the order of `2^64` allocations to retire them all (see
+[Slot lifetime](#slot-lifetime)). Recover by running a collection to free dead slots,
+then retrying; if every slot has retired, nothing can be reclaimed.
 
 ```rust
 use gc_lang::{GcError, Heap, Trace, Tracer};
@@ -608,8 +686,12 @@ heap is cheap; collecting a mostly-live one costs about `~12 ns` per object.
 <h3 id="pattern-multiple-heaps">Multiple heaps</h3>
 
 A program may run several heaps. The `T` tag on [`Gc<T>`](#gc) keeps their handles from
-being confused at compile time when the heaps hold different types. Each heap collects
-independently against its own roots.
+being confused at compile time when the heaps hold different types — but not when two
+heaps hold the *same* type: a handle carries no heap identity, so keep track of which
+heap each handle came from. Each heap collects independently against its own roots. An
+object in one heap that holds a handle into another does not keep that object alive
+through tracing ([`Tracer::mark`](#tracer)); pass such handles to the other heap's
+`collect` as roots.
 
 <h3 id="pattern-no-std">`no_std`</h3>
 

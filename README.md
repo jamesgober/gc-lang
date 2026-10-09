@@ -63,7 +63,8 @@ no policy on *when* to collect. The runtime keeps that control.
 - **Cycle-collecting** — tracing reachability reclaims what reference counting cannot.
 - **Safe by construction** — `#![forbid(unsafe_code)]`; a stale handle reads as absent, never dangles.
 - **Generational handles** — `Gc<T>` is `Copy`, eight bytes, and `Eq`/`Ord`/`Hash` for any `T`.
-- **Slot reuse** — sweeping returns slots to a free list; steady-state loops never grow the store.
+- **Slot reuse** — sweeping returns slots to a free list. A slot serves `2^32` occupants and is then retired rather than wrapping its generation, so a stale handle stays stale for the heap's lifetime; a steady-state loop grows the store by one slot per `2^32` reuses of a slot, and not otherwise.
+- **Panic-safe collection** — a destructor or `trace` that panics mid-collection leaves the heap consistent: no leaked slot, exact `len`.
 - **Allocation-free collection** — the mark queue and mark bitset are pooled across passes.
 - **`no_std`** — needs only `alloc`; the default `std` feature changes nothing in the public surface.
 - **Zero runtime dependencies** — the collector is self-contained.
@@ -139,11 +140,20 @@ A collection is two phases:
    live in a packed bitset, one bit per slot.
 2. **Sweep.** Every object not marked is dropped, its slot's generation is advanced —
    which invalidates any outstanding handle to it — and the slot is returned to a free
-   list for the next allocation to reuse.
+   list for the next allocation to reuse. A slot's bookkeeping is finished before the
+   object's destructor runs, so a panicking destructor cannot leak the slot or skew
+   the live count.
 
 The generation stamp is the safety mechanism: because a reused slot carries a new
 generation, a handle to a collected object no longer matches whatever now lives there.
-It resolves to `None`, never to an unrelated value.
+It resolves to `None`, never to an unrelated value. Generations never wrap: a slot that
+has used all `2^32` of its generations is retired for good, so no `(index, generation)`
+pair is ever issued twice. The exact capacity consequences are in
+[`docs/API.md`](./docs/API.md#slot-lifetime).
+
+A handle does not record which heap minted it, and `Tracer::mark` accepts a handle of
+any type. Use each handle only with the heap that returned it, and mark only handles
+into the heap being collected; the API reference spells out what happens otherwise.
 
 The cost is `O(reachable)` to mark plus `O(slots)` to sweep. The mark queue and the
 mark bitset are retained between calls, so a steady-state collection allocates nothing.
@@ -164,8 +174,11 @@ cargo run --example object_graph       # shared subgraphs and a shrinking root s
 
 ## Performance
 
-Latest local Criterion means (release build, WSL2 Ubuntu on Windows x86_64). Numbers
-vary by CPU and environment; reproduce with `cargo bench`.
+Criterion means measured for 1.0.0 (release build, WSL2 Ubuntu on Windows x86_64).
+1.0.1 changed the sweep's bookkeeping; a same-machine 1.0.0-vs-1.0.1 comparison on
+Windows showed no difference above run-to-run noise (see the
+[1.0.1 release notes](./docs/release/v1.0.1.md)). Numbers vary by CPU and environment;
+reproduce with `cargo bench`.
 
 | Operation                         | Cost        | Notes                                    |
 |-----------------------------------|-------------|------------------------------------------|
@@ -199,7 +212,10 @@ cargo bench                        # Criterion benchmarks
 The property suite checks the collector's core invariant — an object is live after a
 collection **if and only if** it was reachable from a root — against an independent
 breadth-first walk over arbitrary generated graphs, cycles and shared subgraphs
-included.
+included. A second property drives slots through the end of their generation range
+(via a test-only hook) and checks that no handle is ever issued twice and no stale
+handle ever resolves. `tests/panic_safety.rs` checks that panicking destructors and
+`trace` impls leave the heap consistent.
 
 <br>
 

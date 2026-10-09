@@ -19,11 +19,16 @@ use core::marker::PhantomData;
 /// slot's generation advances every time the slot is reclaimed and reused, so a
 /// handle to an object that was collected no longer matches the object now living
 /// in that slot: it resolves to `None` rather than silently aliasing an unrelated
-/// value. A handle is therefore never a dangling pointer — at worst it is a stale
-/// handle that reads as absent.
+/// value. Generations never wrap — a slot that has used all `2^32` of them is
+/// retired, not recycled — so this holds for the heap's whole lifetime. A handle
+/// is therefore never a dangling pointer — at worst it is a stale handle that
+/// reads as absent.
 ///
 /// The `T` tag is compile-time only and occupies no space: it stops a `Gc<Value>`
-/// from being resolved against a `Heap<Node>`. `Gc<T>` is `Copy`, `Eq`, `Ord`, and
+/// from being resolved against a `Heap<Node>`. A handle does **not** record which
+/// heap minted it, so two heaps of the same `T` cannot tell each other's handles
+/// apart: a handle from one may resolve to an unrelated object in the other. Use
+/// each handle only with the heap that returned it. `Gc<T>` is `Copy`, `Eq`, `Ord`, and
 /// `Hash` for **every** `T` — the tag never adds a bound — so it works as a map key
 /// regardless of what it points at. There is no public constructor: a `Gc` can only
 /// come from [`Heap::alloc`](crate::Heap::alloc) / [`try_alloc`](crate::Heap::try_alloc).

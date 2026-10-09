@@ -27,6 +27,10 @@ use crate::Gc;
 /// - **Marking more than you own is safe.** Extra marks at worst keep an object
 ///   alive one cycle longer. The collector already ignores handles that do not name
 ///   a live object, so a stale handle you mark costs nothing.
+/// - **Mark only handles into the heap being collected.** [`Tracer::mark`] accepts
+///   a handle of any type and reads it as a position in the collecting heap; a
+///   handle from another heap does not keep its own object alive and may keep an
+///   unrelated one alive. See [`Tracer::mark`] for the details.
 /// - **`trace` must not allocate into the heap or mutate the object.** It is a
 ///   read-only enumeration; it takes `&self` for exactly that reason.
 ///
@@ -109,8 +113,32 @@ impl<'a> Tracer<'a> {
     ///
     /// Call this once for every handle the object owns. Marking a handle that does
     /// not name a live object is harmless: the collector rejects it when it reaches
-    /// the front of the queue. The generic parameter lets a value mix handles into
-    /// several heaps; each is validated against its own heap when that heap collects.
+    /// the front of the queue.
+    ///
+    /// # Only handles into the heap being collected do anything
+    ///
+    /// `mark` is generic: it accepts a `Gc<U>` for **any** `U`, not only handles of
+    /// the type the collecting heap stores, and the compiler does not check that
+    /// the handle came from that heap. The collector reads every marked handle as
+    /// an `(index, generation)` pair in *the heap that is collecting*. So for a
+    /// handle that came from somewhere else (a heap of another type, or another
+    /// heap of the same type):
+    ///
+    /// - **It does not keep its own object alive.** Marking a handle into heap `B`
+    ///   while heap `A` collects does nothing for `B`. An object in `B` that is
+    ///   referenced only from objects in `A` survives `B`'s collections only if the
+    ///   runtime passes that handle to `B`'s [`collect`](crate::Heap::collect) as a
+    ///   root.
+    /// - **It may keep an unrelated object alive.** If its index and generation
+    ///   happen to match a live object in `A`, that object is marked — and traced —
+    ///   for this collection, though nothing in `A` references it. This is never
+    ///   unsound (no handle can dangle; the crate has no `unsafe`), but it is
+    ///   over-retention: memory that should have been reclaimed is kept until a
+    ///   later collection in which the coincidence does not recur.
+    ///
+    /// Mark only handles into the heap whose objects you are tracing. Restricting
+    /// `mark` to that heap's handle type is a breaking change and is planned for
+    /// 2.0 (see the crate's `dev/ROADMAP.md`).
     ///
     /// # Examples
     ///

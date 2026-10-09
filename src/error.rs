@@ -6,9 +6,12 @@ use core::fmt;
 ///
 /// The heap addresses its slots with a 32-bit index, so it can hold up to
 /// `u32::MAX + 1` distinct slots over its lifetime. Slots are reused as objects
-/// are reclaimed, so this ceiling counts *simultaneously live plus never-yet-freed*
-/// slots, not total allocations — a program that allocates and collects in a steady
-/// loop never approaches it. Reaching the ceiling is the one recoverable failure an
+/// are reclaimed, so this ceiling counts slots that are occupied or *retired*, not
+/// total allocations. A slot retires — and is never reused — only after it has
+/// served `2^32` occupants (every value of its 32-bit generation stamp), so a
+/// program that allocates and collects in a steady loop consumes one slot index per
+/// `2^32` reuses of a slot: on the order of `2^64` allocations to reach the
+/// ceiling. Reaching the ceiling is the one recoverable failure an
 /// allocation can hit; [`Heap::try_alloc`] reports it through this type instead of
 /// aborting, so a runtime driving the heap from untrusted input can fail cleanly
 /// rather than crash.
@@ -38,13 +41,15 @@ use core::fmt;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum GcError {
-    /// The heap's slot space is full: it already addresses `u32::MAX + 1` slots
-    /// and cannot represent another handle.
+    /// The heap's slot space is full: no slot is free, and all `u32::MAX + 1` slot
+    /// indices are occupied or retired, so it cannot represent another handle.
     ///
     /// This is unreachable for any realistic workload — it takes more than four
-    /// billion slots that were never reclaimed — but it is reported rather than
-    /// ignored so the limit is a defined boundary, never a silent wrap. When it
-    /// does occur, run a collection to reclaim dead slots before allocating again.
+    /// billion slots that are live or never reclaimed, or on the order of `2^64`
+    /// allocations to retire them — but it is reported rather than ignored so the
+    /// limit is a defined boundary, never a silent wrap. When it does occur, run a
+    /// collection to reclaim dead slots before allocating again; if every slot has
+    /// retired, nothing can be reclaimed and the heap cannot allocate again.
     CapacityExhausted,
 }
 
