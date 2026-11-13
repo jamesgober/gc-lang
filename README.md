@@ -18,7 +18,7 @@
 
 <div align="left">
     <p>
-        gc-lang is the LXRT-tier crate: A garbage collector for the LexerSketch runtime (interpreted languages). Part of the -lang language-construction family; see _strategy/LANG_COLLECTION.md for the master plan.
+        gc-lang is the LXRT-tier crate: A garbage collector for the toolchain's runtime (interpreted languages). Part of the -lang language-construction family; see _strategy/LANG_COLLECTION.md for the master plan.
     </p>
     <br>
     <hr>

@@ -10,7 +10,7 @@ Compiles, CI green, structure correct, no domain logic.
 - [x] Manifest, README, CHANGELOG, REPS, dual license, CI, deny, clippy, rustfmt.
 
 ## v0.2.0 - Core (THE HARD PART, NOT DEFERRED) — DONE
-A garbage collector for the LexerSketch runtime (interpreted languages).
+A garbage collector for the toolchain's runtime (interpreted languages).
 Delivered a safe, handle-based tracing mark-and-sweep collector: `Heap<T>`, the
 `Gc<T>` generation-stamped handle, the `Trace`/`Tracer` reachability contract, and
 `GcError`. Cycles are reclaimed; slots are reused; scratch is pooled.
@@ -68,7 +68,7 @@ wired (unchanged from 1.0.0).
 
 ## 2.0 - planned breaking changes (recorded per the anti-deferral rule)
 These change the public surface or `Gc<T>`'s layout, so they cannot ship in 1.x.
-None is held by difficulty; each is held only by SemVer, and the LexerSketch
+None is held by difficulty; each is held only by SemVer, and the toolchain
 roadmap (phase 4.5) schedules them together with wiring gc-lang into value-lang /
 bvm-lang so the 2.0 surface is designed once.
 - **Typed `mark` (M61).** `Tracer::mark<U>(Gc<U>)` accepts a handle of any type.
